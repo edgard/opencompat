@@ -1,0 +1,169 @@
+# Default values for opencompat.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Image configuration
+image:
+  repository: ghcr.io/edgard/opencompat
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Service account configuration
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Automatically mount a ServiceAccount's API credentials?
+  automount: false
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+# Application configuration (environment variables)
+config:
+  # Server binding address (use 0.0.0.0 for container networking)
+  host: "0.0.0.0"
+  # Server listening port
+  port: "8080"
+  # Enable verbose logging
+  verbose: "false"
+  # Reasoning effort level: none, low, medium, high, xhigh
+  reasoningEffort: "medium"
+  # Reasoning summary mode: auto, concise, detailed
+  reasoningSummary: "auto"
+  # Reasoning compatibility mode
+  reasoningCompat: "none"
+  # Text verbosity level: low, medium, high
+  textVerbosity: "medium"
+  # Instructions cache refresh interval in minutes
+  instructionsRefresh: "1440"
+  # Optional: Custom OAuth client ID (leave empty to use default)
+  oauthClientID: ""
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+  hosts:
+    - host: opencompat.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: opencompat-tls
+      hosts:
+        - opencompat.example.com
+
+# Persistent storage configuration
+persistence:
+  # Data volume for OAuth credentials (critical - backup required)
+  data:
+    enabled: true
+    # Storage class name (empty string uses cluster default)
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 1Gi
+    annotations: {}
+  # Cache volume for instruction files (recoverable from GitHub)
+  cache:
+    enabled: true
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 5Gi
+    annotations: {}
+
+# Resource limits and requests
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Startup probe configuration
+# Protects slow startup (instruction prefetch from GitHub can take time)
+startupProbe:
+  enabled: true
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 12  # 60 seconds total
+
+# Liveness probe configuration
+# Restarts pod if server hangs
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# Readiness probe configuration
+# Removes from service during transient issues
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Node selector for pod assignment
+nodeSelector: {}
+
+# Tolerations for pod assignment
+tolerations: []
+
+# Affinity for pod assignment
+affinity: {}
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}

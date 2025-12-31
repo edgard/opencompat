@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "opencompat.fullname" . }}-test-connection"
+  labels:
+    {{- include "opencompat.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": hook-succeeded,hook-failed
+spec:
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command: ['wget']
+      args: ['--spider', '--quiet', '{{ include "opencompat.fullname" . }}:{{ .Values.service.port }}/health']
+  restartPolicy: Never

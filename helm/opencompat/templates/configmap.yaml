@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "opencompat.fullname" . }}
+  labels:
+    {{- include "opencompat.labels" . | nindent 4 }}
+data:
+  OPENCOMPAT_HOST: {{ .Values.config.host | quote }}
+  OPENCOMPAT_PORT: {{ .Values.config.port | quote }}
+  OPENCOMPAT_VERBOSE: {{ .Values.config.verbose | quote }}
+  OPENCOMPAT_REASONING_EFFORT: {{ .Values.config.reasoningEffort | quote }}
+  OPENCOMPAT_REASONING_SUMMARY: {{ .Values.config.reasoningSummary | quote }}
+  OPENCOMPAT_REASONING_COMPAT: {{ .Values.config.reasoningCompat | quote }}
+  OPENCOMPAT_TEXT_VERBOSITY: {{ .Values.config.textVerbosity | quote }}
+  OPENCOMPAT_INSTRUCTIONS_REFRESH: {{ .Values.config.instructionsRefresh | quote }}
+  XDG_DATA_HOME: "/data"
+  XDG_CACHE_HOME: "/cache"

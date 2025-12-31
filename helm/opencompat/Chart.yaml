@@ -1,0 +1,21 @@
+apiVersion: v2
+name: opencompat
+description: Personal API compatibility layer providing OpenAI-compatible interface
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+keywords:
+  - openai
+  - api
+  - proxy
+  - compatibility
+
+home: https://github.com/edgard/opencompat
+sources:
+  - https://github.com/edgard/opencompat
+
+maintainers:
+  - name: edgard
+
+kubeVersion: ">=1.23.0-0"

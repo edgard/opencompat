@@ -1,0 +1,62 @@
+OpenCompat has been deployed successfully!
+
+{{- if not (lookup "v1" "Secret" .Release.Namespace "opencompat-auth") }}
+
+WARNING: Authentication not configured!
+
+To set up authentication, you need to:
+
+1. Login locally using the opencompat CLI:
+   $ opencompat login
+
+2. Create a Kubernetes secret from your credentials:
+   $ kubectl create secret generic opencompat-auth \
+       --from-file=auth.json=$HOME/.local/share/opencompat/auth.json \
+       -n {{ .Release.Namespace }}
+
+3. Restart the pod to pick up the credentials:
+   $ kubectl rollout restart statefulset/{{ include "opencompat.fullname" . }} -n {{ .Release.Namespace }}
+
+{{- else }}
+
+Authentication is configured via the opencompat-auth secret.
+{{- end }}
+
+To access your OpenCompat service:
+
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  Visit: http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}
+{{- end }}
+{{- else }}
+
+1. Port-forward to the service:
+   $ kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "opencompat.fullname" . }} 8080:8080
+
+2. Access the API at http://localhost:8080
+{{- end }}
+
+To test the deployment:
+
+1. Check health:
+   $ curl http://localhost:8080/health
+   Expected: {"status":"ok"}
+
+2. List available models:
+   $ curl http://localhost:8080/v1/models
+
+3. Make a test completion request:
+   $ curl http://localhost:8080/v1/chat/completions \
+       -H "Content-Type: application/json" \
+       -d '{
+         "model": "gpt-5",
+         "messages": [{"role": "user", "content": "Hello!"}]
+       }'
+
+To view logs:
+   $ kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "opencompat.name" . }} -f
+
+To check pod status:
+   $ kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "opencompat.name" . }}
+
+For more information, visit: https://github.com/edgard/opencompat
