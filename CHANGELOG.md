@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3](https://github.com/edgard/opencompat/compare/v1.0.2...v1.0.3) (2025-12-31)
+
+
+### Bug Fixes
+
+* **copilot:** simplify provider as thin OpenAI pass-through ([#7](https://github.com/edgard/opencompat/issues/7)) ([d4d466e](https://github.com/edgard/opencompat/commit/d4d466ea281edb66efdd0ecdcc95285e7d1ff28c))
+
 ## [1.0.2](https://github.com/edgard/opencompat/compare/v1.0.1...v1.0.2) (2025-12-31)
 
 
