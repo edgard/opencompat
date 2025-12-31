@@ -2,79 +2,75 @@ package copilot
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/edgard/opencompat/internal/api"
 	"github.com/edgard/opencompat/internal/sse"
 )
 
 // Stream implements the provider.Stream interface for Copilot responses.
-// Copilot uses standard OpenAI SSE format, so this is simpler than ChatGPT's
-// Responses API transformation.
+// Copilot uses standard OpenAI format, so this is a thin pass-through wrapper.
 type Stream struct {
-	resp         *http.Response
-	reader       *sse.Reader
-	stream       bool
-	includeUsage bool
-	done         bool
-	response     *api.ChatCompletionResponse
-	err          error
-	sentUsage    bool
-	lastChunk    *api.ChatCompletionChunk // For capturing usage
+	resp          *http.Response
+	reader        *sse.Reader
+	streaming     bool
+	done          bool
+	statusChecked bool
+	response      *api.ChatCompletionResponse
+	err           error
 }
 
 // NewStream creates a new stream from an HTTP response.
-func NewStream(resp *http.Response, stream, includeUsage bool) *Stream {
-	return &Stream{
-		resp:         resp,
-		reader:       sse.NewReader(resp.Body),
-		stream:       stream,
-		includeUsage: includeUsage,
+func NewStream(resp *http.Response, streaming bool) *Stream {
+	s := &Stream{
+		resp:      resp,
+		streaming: streaming,
 	}
+	if streaming {
+		s.reader = sse.NewReader(resp.Body)
+	}
+	return s
 }
 
 // Next returns the next chunk from the stream.
+// For non-streaming requests, returns io.EOF immediately (use Response() to get the result).
 func (s *Stream) Next() (*api.ChatCompletionChunk, error) {
 	if s.done {
 		return nil, io.EOF
 	}
 
-	// Check HTTP response status
-	if s.resp.StatusCode != http.StatusOK {
-		s.done = true
-		body, _ := io.ReadAll(s.resp.Body)
-		s.err = api.NewUpstreamError(s.resp.StatusCode, parseUpstreamError(body))
-		return nil, s.err
+	// Check HTTP status once
+	if !s.statusChecked {
+		s.statusChecked = true
+		if s.resp.StatusCode != http.StatusOK {
+			s.done = true
+			body, _ := io.ReadAll(s.resp.Body)
+			s.err = api.NewUpstreamError(s.resp.StatusCode, parseUpstreamError(body))
+			return nil, s.err
+		}
+
+		// For non-streaming: read response immediately and return EOF
+		if !s.streaming {
+			s.done = true
+			return nil, s.readNonStreaming()
+		}
 	}
 
+	// Streaming: read next SSE event
 	for {
 		event, err := s.reader.ReadEvent()
 		if err != nil {
-			if err == io.EOF {
-				s.done = true
-
-				// Send final usage chunk if requested and we have usage data
-				if s.includeUsage && !s.sentUsage && s.lastChunk != nil && s.lastChunk.Usage != nil {
-					s.sentUsage = true
-					return &api.ChatCompletionChunk{
-						ID:      s.lastChunk.ID,
-						Object:  "chat.completion.chunk",
-						Created: s.lastChunk.Created,
-						Model:   s.lastChunk.Model,
-						Choices: []api.Choice{},
-						Usage:   s.lastChunk.Usage,
-					}, nil
-				}
-
-				return nil, io.EOF
+			s.done = true
+			if err != io.EOF {
+				s.err = err
 			}
-			s.err = err
 			return nil, err
 		}
 
-		// Skip events with no data
+		// Skip empty events
 		if len(event.Data) == 0 {
 			continue
 		}
@@ -82,122 +78,35 @@ func (s *Stream) Next() (*api.ChatCompletionChunk, error) {
 		// Parse chunk
 		var chunk api.ChatCompletionChunk
 		if err := json.Unmarshal(event.Data, &chunk); err != nil {
-			// Skip malformed events
-			continue
+			continue // Skip malformed events
 		}
 
-		// Normalize chunk: ensure Object is set (Copilot may send empty object field)
-		if chunk.Object == "" {
-			chunk.Object = "chat.completion.chunk"
-		}
-
-		// Store for potential usage extraction
-		if chunk.Usage != nil {
-			s.lastChunk = &chunk
-		}
-
-		// Accumulate for non-streaming response
-		if !s.stream {
-			s.accumulateResponse(&chunk)
-		}
-
+		normalizeChunk(&chunk)
 		return &chunk, nil
 	}
 }
 
-// accumulateResponse builds the non-streaming response from chunks.
-func (s *Stream) accumulateResponse(chunk *api.ChatCompletionChunk) {
-	if s.response == nil {
-		s.response = &api.ChatCompletionResponse{
-			ID:                chunk.ID,
-			Object:            "chat.completion",
-			Created:           chunk.Created,
-			Model:             chunk.Model,
-			SystemFingerprint: chunk.SystemFingerprint,
-			Choices:           make([]api.Choice, len(chunk.Choices)),
-		}
-		for i := range chunk.Choices {
-			s.response.Choices[i] = api.Choice{
-				Index:   chunk.Choices[i].Index,
-				Message: &api.Message{Role: "assistant"},
-			}
-		}
+// readNonStreaming reads and parses a non-streaming response.
+// Returns io.EOF on success (response available via Response()), or error on failure.
+func (s *Stream) readNonStreaming() error {
+	body, err := io.ReadAll(s.resp.Body)
+	if err != nil {
+		s.err = err
+		return err
 	}
 
-	// Update response metadata from subsequent chunks if initially empty
-	// (Copilot may send an empty first chunk followed by chunks with actual data)
-	if s.response.ID == "" && chunk.ID != "" {
-		s.response.ID = chunk.ID
-	}
-	if s.response.Model == "" && chunk.Model != "" {
-		s.response.Model = chunk.Model
-	}
-	if s.response.Created == 0 && chunk.Created != 0 {
-		s.response.Created = chunk.Created
-	}
-	if s.response.SystemFingerprint == "" && chunk.SystemFingerprint != "" {
-		s.response.SystemFingerprint = chunk.SystemFingerprint
+	var resp api.ChatCompletionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		s.err = err
+		return err
 	}
 
-	// Accumulate content from deltas
-	for _, cc := range chunk.Choices {
-		// Expand choices array if needed (handles empty first chunk from Copilot)
-		for len(s.response.Choices) <= cc.Index {
-			s.response.Choices = append(s.response.Choices, api.Choice{
-				Index:   len(s.response.Choices),
-				Message: &api.Message{Role: "assistant"},
-			})
-		}
-
-		choice := &s.response.Choices[cc.Index]
-		if choice.Message == nil {
-			choice.Message = &api.Message{Role: "assistant"}
-		}
-		if cc.Delta != nil {
-			if cc.Delta.Content != "" {
-				// Append to existing content
-				existingContent := choice.Message.GetContentString()
-				choice.Message.SetContentString(existingContent + cc.Delta.Content)
-			}
-			if cc.Delta.Role != "" {
-				choice.Message.Role = cc.Delta.Role
-			}
-			// Handle tool calls
-			if len(cc.Delta.ToolCalls) > 0 {
-				for _, tc := range cc.Delta.ToolCalls {
-					idx := 0
-					if tc.Index != nil {
-						idx = *tc.Index
-					}
-					// Ensure we have enough tool calls
-					for len(choice.Message.ToolCalls) <= idx {
-						choice.Message.ToolCalls = append(choice.Message.ToolCalls, api.ToolCall{
-							Type: "function",
-						})
-					}
-					// Merge delta into tool call
-					if tc.ID != "" {
-						choice.Message.ToolCalls[idx].ID = tc.ID
-					}
-					if tc.Function.Name != "" {
-						choice.Message.ToolCalls[idx].Function.Name = tc.Function.Name
-					}
-					choice.Message.ToolCalls[idx].Function.Arguments += tc.Function.Arguments
-				}
-			}
-		}
-		if cc.FinishReason != nil {
-			choice.FinishReason = cc.FinishReason
-		}
-	}
-
-	// Capture usage
-	if chunk.Usage != nil {
-		s.response.Usage = chunk.Usage
-	}
+	normalizeResponse(&resp)
+	s.response = &resp
+	return io.EOF
 }
 
-// Response returns the accumulated non-streaming response.
+// Response returns the non-streaming response.
 func (s *Stream) Response() *api.ChatCompletionResponse {
 	return s.response
 }
@@ -215,7 +124,27 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-// parseUpstreamError attempts to extract a meaningful error message from upstream response.
+// normalizeChunk ensures OpenAI-required fields are set on streaming chunks.
+func normalizeChunk(chunk *api.ChatCompletionChunk) {
+	if chunk.Object == "" {
+		chunk.Object = "chat.completion.chunk"
+	}
+	if chunk.Created == 0 {
+		chunk.Created = time.Now().Unix()
+	}
+}
+
+// normalizeResponse ensures OpenAI-required fields are set on non-streaming responses.
+func normalizeResponse(resp *api.ChatCompletionResponse) {
+	if resp.Object == "" {
+		resp.Object = "chat.completion"
+	}
+	if resp.Created == 0 {
+		resp.Created = time.Now().Unix()
+	}
+}
+
+// parseUpstreamError extracts a meaningful error message from upstream response.
 func parseUpstreamError(body []byte) string {
 	var errResp struct {
 		Error struct {
@@ -224,34 +153,38 @@ func parseUpstreamError(body []byte) string {
 		Message string `json:"message"`
 	}
 
+	message := ""
 	if err := json.Unmarshal(body, &errResp); err == nil {
 		if errResp.Error.Message != "" {
-			return errResp.Error.Message
-		}
-		if errResp.Message != "" {
-			return errResp.Message
+			message = errResp.Error.Message
+		} else if errResp.Message != "" {
+			message = errResp.Message
 		}
 	}
 
-	bodyStr := string(body)
-	if len(bodyStr) > 500 {
-		bodyStr = bodyStr[:500] + "..."
+	if message == "" {
+		bodyStr := string(body)
+		if len(bodyStr) > 500 {
+			bodyStr = bodyStr[:500] + "..."
+		}
+		if bodyStr == "" {
+			return "unknown error"
+		}
+		message = bodyStr
 	}
-	if bodyStr == "" {
-		return "unknown error"
-	}
-	return bodyStr
+
+	// Enhance error messages with helpful hints
+	return enhanceErrorMessage(message)
 }
 
-// NonStreamingRead reads the entire response for non-streaming mode.
-func (s *Stream) NonStreamingRead() (*api.ChatCompletionResponse, error) {
-	for {
-		_, err := s.Next()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return s.response, nil
-			}
-			return nil, err
-		}
+// enhanceErrorMessage adds helpful context to known error messages.
+func enhanceErrorMessage(message string) string {
+	lower := strings.ToLower(message)
+	// Help users when a model isn't enabled in their Copilot settings
+	// Check for "model" to avoid matching unrelated "not supported" errors
+	if strings.Contains(lower, "model") &&
+		(strings.Contains(lower, "not supported") || strings.Contains(lower, "not available")) {
+		return message + "\n\nMake sure the model is enabled in your Copilot settings: https://github.com/settings/copilot"
 	}
+	return message
 }

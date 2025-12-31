@@ -13,6 +13,7 @@ import (
 	"github.com/edgard/opencompat/internal/api"
 	"github.com/edgard/opencompat/internal/auth"
 	"github.com/edgard/opencompat/internal/httputil"
+	"github.com/google/uuid"
 )
 
 // CopilotToken represents a token obtained from the Copilot API.
@@ -151,33 +152,25 @@ func (c *Client) SendRequest(ctx context.Context, chatReq *api.ChatCompletionReq
 	// Set required headers
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("User-Agent", httputil.BuildUserAgent("GitHubCopilotChat", "0.22.4"))
+	if chatReq.Stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	req.Header.Set("User-Agent", httputil.BuildUserAgent("GitHubCopilotChat", "0.26.7"))
 	req.Header.Set("Editor-Version", EditorVersion)
 	req.Header.Set("Editor-Plugin-Version", EditorPluginVersion)
 	req.Header.Set("Copilot-Integration-Id", CopilotIntegrationID)
+	req.Header.Set("X-GitHub-API-Version", GitHubAPIVersion)
+	req.Header.Set("X-Request-Id", uuid.New().String())
+
+	// X-Initiator: "user" for first turn, "agent" for follow-ups (matches VS Code behavior)
+	req.Header.Set("X-Initiator", getInitiator(chatReq.Messages))
+	// Openai-Intent: "conversation-panel" for full OpenAI API capabilities
 	req.Header.Set("Openai-Intent", "conversation-panel")
 
-	// Set X-Initiator header based on message content
-	// "agent" if there are tool/assistant messages, else "user"
-	initiator := "user"
-	for _, msg := range chatReq.Messages {
-		if msg.Role == "assistant" || msg.Role == "tool" {
-			initiator = "agent"
-			break
-		}
-	}
-	req.Header.Set("X-Initiator", initiator)
-
-	// Set Copilot-Vision-Request header if any message contains images
-	hasVision := false
-	for _, msg := range chatReq.Messages {
-		if hasImageContent(msg) {
-			hasVision = true
-			break
-		}
-	}
-	if hasVision {
+	// Set Copilot-Vision-Request header if any message contains images (required by Copilot)
+	if hasImageContent(chatReq.Messages) {
 		req.Header.Set("Copilot-Vision-Request", "true")
 	}
 
@@ -190,31 +183,25 @@ func (c *Client) SendRequest(ctx context.Context, chatReq *api.ChatCompletionReq
 	return resp, nil
 }
 
-// hasImageContent checks if a message contains image content.
-func hasImageContent(msg api.Message) bool {
-	// Check if content is an array (multimodal)
-	if msg.Content == nil {
-		return false
-	}
-
-	// Try to parse as array of content parts
-	contentBytes, err := json.Marshal(msg.Content)
-	if err != nil {
-		return false
-	}
-
-	var parts []struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(contentBytes, &parts); err != nil {
-		return false
-	}
-
-	for _, part := range parts {
-		if part.Type == "image_url" || part.Type == "image" {
-			return true
+// hasImageContent checks if any message contains image content.
+func hasImageContent(messages []api.Message) bool {
+	for _, msg := range messages {
+		for _, part := range msg.GetContentParts() {
+			if part.Type == "image_url" || part.Type == "image" {
+				return true
+			}
 		}
 	}
-
 	return false
+}
+
+// getInitiator returns "user" for first turn or "agent" for follow-up turns.
+// Matches VS Code behavior: "user" when no assistant/tool messages exist yet.
+func getInitiator(messages []api.Message) string {
+	for _, msg := range messages {
+		if msg.Role == "assistant" || msg.Role == "tool" {
+			return "agent"
+		}
+	}
+	return "user"
 }

@@ -70,14 +70,16 @@ func (p *Provider) SupportsModel(modelID string) bool {
 
 // ChatCompletion sends a chat completion request.
 func (p *Provider) ChatCompletion(ctx context.Context, req *provider.ChatCompletionRequest) (provider.Stream, error) {
+	// Transform messages: convert system role to assistant (Copilot compatibility)
+	messages := transformMessages(req.Messages)
+
 	// Convert provider request to API request for Copilot
-	// Copilot uses standard OpenAI format and supports most parameters
 	chatReq := &api.ChatCompletionRequest{
 		Model:               req.Model,
-		Messages:            req.Messages,
+		Messages:            messages,
 		Tools:               req.Tools,
 		ToolChoice:          req.ToolChoice,
-		Stream:              true, // Always stream from Copilot
+		Stream:              req.Stream,
 		StreamOptions:       req.StreamOptions,
 		Temperature:         req.Temperature,
 		TopP:                req.TopP,
@@ -96,8 +98,19 @@ func (p *Provider) ChatCompletion(ctx context.Context, req *provider.ChatComplet
 		return nil, err
 	}
 
-	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-	return NewStream(resp, req.Stream, includeUsage), nil
+	return NewStream(resp, req.Stream), nil
+}
+
+// transformMessages converts system messages to assistant role for Copilot compatibility.
+func transformMessages(messages []api.Message) []api.Message {
+	result := make([]api.Message, len(messages))
+	for i, msg := range messages {
+		result[i] = msg
+		if msg.Role == "system" {
+			result[i].Role = "assistant"
+		}
+	}
+	return result
 }
 
 // Init performs initialization - fetches models list.

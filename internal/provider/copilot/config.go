@@ -37,10 +37,11 @@ const (
 
 // Required headers for Copilot API
 const (
-	EditorVersion        = "vscode/1.95.3"
-	EditorPluginVersion  = "copilot-chat/0.22.4"
+	EditorVersion        = "vscode/1.95.0"
+	EditorPluginVersion  = "copilot-chat/0.26.7"
 	CopilotIntegrationID = "vscode-chat"
-	UserAgentValue       = "GitHubCopilotChat/0.22.4"
+	UserAgentValue       = "GitHubCopilotChat/0.26.7"
+	GitHubAPIVersion     = "2025-04-01"
 )
 
 // Config holds Copilot-specific configuration.
