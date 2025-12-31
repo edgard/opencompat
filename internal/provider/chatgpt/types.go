@@ -10,13 +10,18 @@ type ResponsesRequest struct {
 	Input             []InputItem      `json:"input"`
 	Tools             []ToolDef        `json:"tools,omitempty"`
 	ToolChoice        json.RawMessage  `json:"tool_choice,omitempty"`
-	ParallelToolCalls bool             `json:"parallel_tool_calls"`
+	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
 	Store             bool             `json:"store"`
 	Stream            bool             `json:"stream"`
 	Reasoning         *ReasoningConfig `json:"reasoning,omitempty"`
 	Text              *TextConfig      `json:"text,omitempty"`
 	Include           []string         `json:"include,omitempty"`
 	PromptCacheKey    string           `json:"prompt_cache_key,omitempty"`
+	// Sampling parameters
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            *float64        `json:"top_p,omitempty"`
+	MaxOutputTokens *int            `json:"max_output_tokens,omitempty"`
+	Stop            json.RawMessage `json:"stop,omitempty"` // string or []string
 }
 
 // InputItem represents an item in the input array.
@@ -108,9 +113,24 @@ const (
 	EventFileSearchCallInProgress = "response.file_search_call.in_progress"
 
 	// MCP (Model Context Protocol) events
-	EventMCPCallInProgress = "response.mcp_call.in_progress"
-	EventMCPCallCompleted  = "response.mcp_call.completed"
-	EventMCPCallFailed     = "response.mcp_call.failed"
+	EventMCPCallInProgress     = "response.mcp_call.in_progress"
+	EventMCPCallCompleted      = "response.mcp_call.completed"
+	EventMCPCallFailed         = "response.mcp_call.failed"
+	EventMCPCallArgumentsDelta = "response.mcp_call_arguments.delta"
+	EventMCPCallArgumentsDone  = "response.mcp_call_arguments.done"
+
+	// Code interpreter events
+	EventCodeInterpreterCallInProgress   = "response.code_interpreter_call.in_progress"
+	EventCodeInterpreterCallInterpreting = "response.code_interpreter_call.interpreting"
+	EventCodeInterpreterCallCompleted    = "response.code_interpreter_call.completed"
+	EventCodeInterpreterCallCodeDelta    = "response.code_interpreter_call_code.delta"
+	EventCodeInterpreterCallCodeDone     = "response.code_interpreter_call_code.done"
+
+	// Image generation events
+	EventImageGenerationCallInProgress   = "response.image_generation_call.in_progress"
+	EventImageGenerationCallGenerating   = "response.image_generation_call.generating"
+	EventImageGenerationCallPartialImage = "response.image_generation_call.partial_image"
+	EventImageGenerationCallCompleted    = "response.image_generation_call.completed"
 
 	// Error event
 	EventError = "error"
@@ -145,8 +165,11 @@ type OutputItemDoneData struct {
 }
 
 // OutputItem represents an output item.
+// This struct supports all output item types from the Responses API including:
+// message, function_call, web_search_call, file_search_call, mcp_call,
+// code_interpreter_call, image_generation_call, computer_call, local_shell_call, etc.
 type OutputItem struct {
-	Type      string          `json:"type"` // "message", "function_call"
+	Type      string          `json:"type"` // "message", "function_call", "*_call" types
 	ID        string          `json:"id"`
 	Role      string          `json:"role,omitempty"`
 	Content   []OutputContent `json:"content,omitempty"`
@@ -154,6 +177,21 @@ type OutputItem struct {
 	Name      string          `json:"name,omitempty"`
 	Arguments string          `json:"arguments,omitempty"`
 	Status    string          `json:"status,omitempty"`
+	// Web search fields
+	Parameters *WebSearchCallParam `json:"parameters,omitempty"`
+	// MCP-specific fields
+	ServerLabel string     `json:"server_label,omitempty"`
+	Output      string     `json:"output,omitempty"`
+	Error       *ErrorData `json:"error,omitempty"`
+	// Code interpreter fields
+	Code        string `json:"code,omitempty"`
+	ContainerID string `json:"container_id,omitempty"`
+	// File search fields
+	Queries []string `json:"queries,omitempty"`
+	// Computer/shell action field
+	Action json.RawMessage `json:"action,omitempty"`
+	// Image generation field
+	Result string `json:"result,omitempty"`
 }
 
 // OutputContent represents content in an output item.

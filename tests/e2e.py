@@ -23,7 +23,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
@@ -94,7 +94,8 @@ class TestSuite:
     """Main test suite runner."""
 
     # Provider configurations
-    # Using equivalent modern models across providers
+    # ChatGPT uses gpt-5 (reasoning model), Copilot uses gpt-4o (standard model)
+    # gpt-5 on Copilot has limitations (no stop, max_tokens, specific tool_choice)
     PROVIDERS = {
         "chatgpt": {
             "default_model": "chatgpt/gpt-5",
@@ -116,7 +117,7 @@ class TestSuite:
         },
     }
 
-    def __init__(self, base_url: str, timeout: int, verbose: bool, provider: str):
+    def __init__(self, base_url: str, timeout: int, verbose: bool, provider: str, model: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.verbose = verbose
@@ -125,7 +126,7 @@ class TestSuite:
         # Provider configuration
         self.provider = provider
         self.provider_config = self.PROVIDERS[provider]
-        self.model = self.provider_config["default_model"]
+        self.model = model if model else self.provider_config["default_model"]
 
         # Initialize OpenAI client
         self.client = OpenAI(
@@ -1159,6 +1160,334 @@ def register_tests(suite: TestSuite) -> None:
 
         s.assert_true(found_tool_call, "Should have tool call chunks in stream")
 
+    @suite.test("mcp_multi_turn_conversation", "tools")
+    def _(s: TestSuite):
+        """MCP-style multi-turn: request -> tool call -> tool result -> final response."""
+        # Define an MCP-like tool
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read contents of a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "File path to read"},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+
+        # Step 1: Initial request that should trigger tool call
+        r1 = s.client.chat.completions.create(
+            model=s.model,
+            messages=[
+                {"role": "user", "content": "Read the file /tmp/test.txt and tell me what's in it. Use the read_file tool."}
+            ],
+            tools=tools,
+            tool_choice="required",
+        )
+
+        msg1 = r1.choices[0].message
+        s.assert_is_not_none(msg1.tool_calls, "Should have tool call")
+        s.assert_greater(len(msg1.tool_calls), 0, "Should have at least one tool call")
+
+        tc = msg1.tool_calls[0]
+        s.assert_equal(tc.function.name, "read_file", "Tool name should be 'read_file'")
+
+        # Verify arguments contain path
+        args = json.loads(tc.function.arguments)
+        s.assert_has_key(args, "path", "Arguments should have 'path'")
+
+        # Step 2: Send tool result back
+        r2 = s.client.chat.completions.create(
+            model=s.model,
+            messages=[
+                {"role": "user", "content": "Read the file /tmp/test.txt and tell me what's in it. Use the read_file tool."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": tc.id, "content": "Hello from the test file!"},
+            ],
+            tools=tools,
+        )
+
+        # Should get final response mentioning file content
+        content = r2.choices[0].message.content
+        s.assert_is_not_none(content, "Should have response content")
+        s.assert_contains(content.lower(), "hello", "Response should reference file content")
+
+    @suite.test("mcp_complex_arguments", "tools")
+    def _(s: TestSuite):
+        """Tool with complex nested arguments (objects, arrays)."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_task",
+                    "description": "Create a new task with metadata",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "properties": {
+                                    "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                                    "due_date": {"type": "string"},
+                                },
+                            },
+                        },
+                        "required": ["title"],
+                    },
+                },
+            }
+        ]
+
+        r = s.client.chat.completions.create(
+            model=s.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Create a task titled 'Test task' with tags ['urgent', 'work'] and high priority. Use the create_task tool.",
+                }
+            ],
+            tools=tools,
+            tool_choice="required",
+        )
+
+        msg = r.choices[0].message
+        s.assert_is_not_none(msg.tool_calls, "Should have tool call")
+
+        tc = msg.tool_calls[0]
+        args = json.loads(tc.function.arguments)
+        s.assert_has_key(args, "title", "Arguments should have 'title'")
+        s.assert_type(args["title"], str, "Title should be string")
+
+    @suite.test("mcp_parallel_tool_calls", "tools")
+    def _(s: TestSuite):
+        """Model can make multiple tool calls in parallel."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+
+        r = s.client.chat.completions.create(
+            model=s.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "What's the weather in Paris and Tokyo? Get both using the tool.",
+                }
+            ],
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=True,
+        )
+
+        msg = r.choices[0].message
+        s.assert_is_not_none(msg.tool_calls, "Should have tool calls")
+        # Model may or may not make parallel calls - just verify tool calls work
+        s.assert_greater_equal(len(msg.tool_calls), 1, "Should have at least one tool call")
+
+    @suite.test("mcp_tool_choice_specific", "tools")
+    def _(s: TestSuite):
+        """tool_choice can specify a particular function."""
+        # ChatGPT doesn't support tool_choice with specific function name
+        s.skip_if(s.provider == "chatgpt", "ChatGPT doesn't support tool_choice with specific function")
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "func_a",
+                    "description": "Function A",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "func_b",
+                    "description": "Function B",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+        r = s.client.chat.completions.create(
+            model=s.model,
+            messages=[{"role": "user", "content": "Call func_a."}],
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "func_a"}},
+        )
+
+        msg = r.choices[0].message
+        s.assert_is_not_none(msg.tool_calls, "Should have tool call")
+        s.assert_equal(msg.tool_calls[0].function.name, "func_a", "Should call func_a specifically")
+
+    @suite.test("mcp_streaming_accumulation", "tools")
+    def _(s: TestSuite):
+        """Streaming tool calls accumulate correctly across chunks."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search for information",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+
+        stream = s.client.chat.completions.create(
+            model=s.model,
+            messages=[{"role": "user", "content": "Search for 'test query'. Use the search tool."}],
+            tools=tools,
+            tool_choice="required",
+            stream=True,
+        )
+
+        # Accumulate tool call from stream
+        tool_call_id = None
+        tool_call_name = None
+        tool_call_args = ""
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.id:
+                        tool_call_id = tc.id
+                    if tc.function.name:
+                        tool_call_name = tc.function.name
+                    if tc.function.arguments:
+                        tool_call_args += tc.function.arguments
+
+        s.assert_is_not_none(tool_call_id, "Should have tool call ID")
+        s.assert_equal(tool_call_name, "search", "Tool name should be 'search'")
+        s.assert_greater(len(tool_call_args), 0, "Should have accumulated arguments")
+
+        # Arguments should be valid JSON
+        try:
+            args = json.loads(tool_call_args)
+            s.assert_has_key(args, "query", "Arguments should have 'query'")
+        except json.JSONDecodeError as e:
+            s.assert_true(False, f"Arguments should be valid JSON: {e}")
+
+    @suite.test("mcp_multiple_tool_results", "tools")
+    def _(s: TestSuite):
+        """Handle multiple tool results in conversation."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_data",
+                    "description": "Get data by ID",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                        "required": ["id"],
+                    },
+                },
+            }
+        ]
+
+        # Simulate a conversation with multiple tool results
+        messages = [
+            {"role": "user", "content": "Get data for IDs 1 and 2, then summarize."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_data", "arguments": '{"id": 1}'}},
+                    {"id": "call_2", "type": "function", "function": {"name": "get_data", "arguments": '{"id": 2}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"value": "first"}'},
+            {"role": "tool", "tool_call_id": "call_2", "content": '{"value": "second"}'},
+        ]
+
+        r = s.client.chat.completions.create(
+            model=s.model,
+            messages=messages,
+            tools=tools,
+        )
+
+        content = r.choices[0].message.content
+        s.assert_is_not_none(content, "Should have response")
+        # Should reference the tool results somehow
+        content_lower = content.lower()
+        s.assert_true(
+            "first" in content_lower or "second" in content_lower,
+            "Response should reference tool results",
+        )
+
+    @suite.test("mcp_error_in_tool_result", "tools")
+    def _(s: TestSuite):
+        """Handle error responses in tool results."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "risky_operation",
+                    "description": "An operation that might fail",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        messages = [
+            {"role": "user", "content": "Run the risky operation."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_err", "type": "function", "function": {"name": "risky_operation", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_err", "content": '{"error": "Operation failed: permission denied"}'},
+        ]
+
+        r = s.client.chat.completions.create(
+            model=s.model,
+            messages=messages,
+            tools=tools,
+        )
+
+        content = r.choices[0].message.content
+        s.assert_is_not_none(content, "Should have response even with error result")
+
     # ==========================================================================
     # PARAMETERS TESTS
     # ==========================================================================
@@ -1477,6 +1806,7 @@ def main() -> int:
 Examples:
   python e2e.py                          # Run all tests (chatgpt provider)
   python e2e.py --provider copilot       # Run with copilot provider
+  python e2e.py --model chatgpt/gpt-5    # Run with specific model
   python e2e.py connectivity             # Run connectivity tests only
   python e2e.py basic_chat streaming     # Run multiple categories
   python e2e.py --test single_turn       # Run single test
@@ -1527,11 +1857,16 @@ Examples:
         action="store_true",
         help="Output results as JSON",
     )
+    parser.add_argument(
+        "--model",
+        "-m",
+        help="Override model to use (e.g., chatgpt/gpt-5, copilot/gpt-4o)",
+    )
 
     args = parser.parse_args()
 
     # Create suite and register tests
-    suite = TestSuite(args.server, args.timeout, args.verbose, args.provider)
+    suite = TestSuite(args.server, args.timeout, args.verbose, args.provider, args.model)
     register_tests(suite)
 
     # Handle --list

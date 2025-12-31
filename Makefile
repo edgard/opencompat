@@ -66,7 +66,7 @@ test: ## Run tests
 test-short: ## Run tests (short mode)
 	@go test -short ./...
 
-test-e2e: test-e2e-chatgpt ## Run E2E tests for default provider (chatgpt)
+test-e2e: test-e2e-all ## Run E2E tests for all providers
 
 test-e2e-chatgpt: ## Run E2E tests for ChatGPT provider
 	@echo "Running E2E tests (ChatGPT provider)..."

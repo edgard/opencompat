@@ -87,7 +87,12 @@ func (c *InstructionsCache) prefetchOne(promptFile string) (string, error) {
 	if err == nil {
 		// Save to disk cache (async)
 		go func(pf, content string) {
-			_ = c.saveToDisk(pf, content)
+			if err := c.saveToDisk(pf, content); err != nil {
+				slog.Warn("failed to save instruction to disk cache",
+					"file", pf,
+					"error", err,
+				)
+			}
 		}(promptFile, content)
 		return content, nil
 	}
@@ -153,7 +158,12 @@ func (c *InstructionsCache) refreshAll() {
 
 		// Save to disk cache (async)
 		go func(pf, content string) {
-			_ = c.saveToDisk(pf, content)
+			if err := c.saveToDisk(pf, content); err != nil {
+				slog.Warn("failed to save instruction to disk cache",
+					"file", pf,
+					"error", err,
+				)
+			}
 		}(promptFile, content)
 		successCount++
 	}
@@ -194,7 +204,12 @@ func (c *InstructionsCache) RefreshAll(ctx context.Context) error {
 
 		// Save to disk cache (async)
 		go func(pf, content string) {
-			_ = c.saveToDisk(pf, content)
+			if err := c.saveToDisk(pf, content); err != nil {
+				slog.Warn("failed to save instruction to disk cache",
+					"file", pf,
+					"error", err,
+				)
+			}
 		}(promptFile, content)
 	}
 
@@ -241,7 +256,12 @@ func (c *InstructionsCache) Get(modelID string) (string, error) {
 			}
 			c.mu.Unlock()
 			go func(pf, content string) {
-				_ = c.saveToDisk(pf, content)
+				if err := c.saveToDisk(pf, content); err != nil {
+					slog.Warn("failed to save instruction to disk cache",
+						"file", pf,
+						"error", err,
+					)
+				}
 			}(promptFile, content)
 		}()
 		// Return stale data for now
@@ -275,7 +295,12 @@ func (c *InstructionsCache) Get(modelID string) (string, error) {
 	c.mu.Unlock()
 
 	go func(pf, content string) {
-		_ = c.saveToDisk(pf, content)
+		if err := c.saveToDisk(pf, content); err != nil {
+			slog.Warn("failed to save instruction to disk cache",
+				"file", pf,
+				"error", err,
+			)
+		}
 	}(promptFile, content)
 	return content, nil
 }

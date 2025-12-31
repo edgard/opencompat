@@ -38,6 +38,7 @@ type Message struct {
 	Role             string           `json:"role"`
 	Content          json.RawMessage  `json:"content"` // string or []ContentPart
 	Name             string           `json:"name,omitempty"`
+	Refusal          string           `json:"refusal,omitempty"` // Model refusal message
 	ToolCalls        []ToolCall       `json:"tool_calls,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 	Reasoning        *ReasoningOutput `json:"reasoning,omitempty"`         // For o3 mode
@@ -131,6 +132,7 @@ type LogprobContent struct {
 type Delta struct {
 	Role             string           `json:"role,omitempty"`
 	Content          string           `json:"content,omitempty"`
+	Refusal          string           `json:"refusal,omitempty"` // Model refusal message
 	ToolCalls        []ToolCall       `json:"tool_calls,omitempty"`
 	Reasoning        *ReasoningOutput `json:"reasoning,omitempty"`         // For o3 mode
 	ReasoningSummary string           `json:"reasoning_summary,omitempty"` // For legacy mode
@@ -149,9 +151,21 @@ type ReasoningContent struct {
 
 // Usage represents token usage information.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                     `json:"prompt_tokens"`
+	CompletionTokens        int                     `json:"completion_tokens"`
+	TotalTokens             int                     `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokenDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokenDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokenDetails contains detailed breakdown of prompt tokens.
+type PromptTokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+// CompletionTokenDetails contains detailed breakdown of completion tokens.
+type CompletionTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // ChatCompletionChunk represents a streaming chunk.

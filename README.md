@@ -117,15 +117,15 @@ parameters are supported (passed to upstream API) vs ignored (accepted but not u
 
 | Parameter | ChatGPT | Copilot |
 |-----------|---------|---------|
-| `temperature` | Ignored | Supported |
-| `top_p` | Ignored | Supported |
-| `max_tokens` | Ignored | Supported |
-| `max_completion_tokens` | Ignored | Supported |
-| `stop` | Ignored | Supported |
+| `temperature` | Supported | Supported |
+| `top_p` | Supported | Supported |
+| `max_tokens` | Supported | Supported |
+| `max_completion_tokens` | Supported | Supported |
+| `stop` | Supported | Supported |
 | `presence_penalty` | Ignored | Supported |
 | `frequency_penalty` | Ignored | Supported |
 | `response_format` | Ignored | Supported |
-| `parallel_tool_calls` | Ignored | Supported |
+| `parallel_tool_calls` | Supported | Supported |
 | `reasoning_effort` | Supported | Ignored |
 | `n` | Ignored | Ignored |
 | `seed` | Ignored | Ignored |

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/edgard/opencompat/internal/api"
@@ -19,19 +20,6 @@ func intPtr(i int) *int {
 // stringPtr returns a pointer to a string value.
 func stringPtr(s string) *string {
 	return &s
-}
-
-// buildWebSearchArgs safely builds JSON arguments for web search tool calls.
-func buildWebSearchArgs(query string) string {
-	if query == "" {
-		return "{}"
-	}
-	args := map[string]string{"query": query}
-	b, err := json.Marshal(args)
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
 }
 
 // TransformRequest converts an OpenAI chat completion request to a ChatGPT Responses API request.
@@ -67,6 +55,9 @@ func TransformRequest(req *api.ChatCompletionRequest, instructions string, cfg *
 	// Generate prompt cache key
 	cacheKey := generateCacheKey(instructions, model)
 
+	// Log warnings for unsupported parameters that are silently ignored
+	logUnsupportedParams(req)
+
 	// Build the request
 	respReq := &ResponsesRequest{
 		Model:             model,
@@ -74,7 +65,7 @@ func TransformRequest(req *api.ChatCompletionRequest, instructions string, cfg *
 		Input:             input,
 		Tools:             tools,
 		ToolChoice:        req.ToolChoice,
-		ParallelToolCalls: false,
+		ParallelToolCalls: req.ParallelToolCalls,
 		Store:             false,
 		Stream:            true, // Always stream, we'll buffer for non-streaming
 		Reasoning: &ReasoningConfig{
@@ -88,7 +79,65 @@ func TransformRequest(req *api.ChatCompletionRequest, instructions string, cfg *
 		PromptCacheKey: cacheKey,
 	}
 
+	// Pass through supported sampling parameters
+	if req.Temperature != nil {
+		respReq.Temperature = req.Temperature
+	}
+	if req.TopP != nil {
+		respReq.TopP = req.TopP
+	}
+	// MaxCompletionTokens is the newer name, MaxTokens is legacy
+	if req.MaxCompletionTokens != nil {
+		respReq.MaxOutputTokens = req.MaxCompletionTokens
+	} else if req.MaxTokens != nil {
+		respReq.MaxOutputTokens = req.MaxTokens
+	}
+	// Pass through stop sequences if present and not null/empty
+	// req.Stop is json.RawMessage, so check for actual content beyond null/[]
+	if len(req.Stop) > 0 {
+		stopStr := string(req.Stop)
+		if stopStr != "null" && stopStr != "[]" {
+			respReq.Stop = req.Stop
+		}
+	}
+
 	return respReq, nil
+}
+
+// logUnsupportedParams logs warnings for request parameters that are not supported
+// by the ChatGPT Responses API and will be silently ignored.
+func logUnsupportedParams(req *api.ChatCompletionRequest) {
+	if req.N != nil && *req.N > 1 {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "n",
+			"value", *req.N,
+			"note", "only n=1 is supported")
+	}
+	if req.PresencePenalty != nil && *req.PresencePenalty != 0 {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "presence_penalty",
+			"value", *req.PresencePenalty)
+	}
+	if req.FrequencyPenalty != nil && *req.FrequencyPenalty != 0 {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "frequency_penalty",
+			"value", *req.FrequencyPenalty)
+	}
+	if len(req.LogitBias) > 0 {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "logit_bias")
+	}
+	if req.Seed != nil {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "seed",
+			"value", *req.Seed)
+	}
+	if req.ResponseFormat != nil {
+		slog.Warn("parameter not supported by ChatGPT Responses API, ignored",
+			"param", "response_format",
+			"type", req.ResponseFormat.Type,
+			"note", "structured output not supported")
+	}
 }
 
 // stripInputIDs removes IDs from input items for stateless operation.
@@ -307,11 +356,11 @@ type StreamState struct {
 	Model                 string
 	Created               int64
 	CurrentContent        string
+	Refusal               string // Model refusal message
 	ReasoningSummary      string
 	ReasoningFull         string
 	ToolCalls             map[int]*api.ToolCall // indexed by output_index
-	WebSearchCalls        map[string]int        // call_id -> output_index for web search
-	WebSearchInitialSent  map[string]bool       // Tracks which web search calls sent initial chunk
+	NextToolIndex         int                   // Next available tool call index
 	FinishReason          string
 	IncompleteReason      string // "max_output_tokens", "content_filter", etc.
 	Usage                 *api.Usage
@@ -320,24 +369,98 @@ type StreamState struct {
 	ThinkTagClosed        bool
 	SawOutput             bool
 	SentStopChunk         bool
-	SentToolCallFinish    bool // Prevents duplicate tool_calls finish chunks
 	PendingSummaryNewline bool
 	ErrorMessage          string
+	// Web search state tracking (like ChatMock's ws_state/ws_index)
+	WebSearchState map[string]*WebSearchAccum // call_id -> accumulated params
+	WebSearchIndex map[string]int             // call_id -> output_index
+}
+
+// WebSearchAccum accumulates web search parameters across streaming events.
+type WebSearchAccum struct {
+	Query      string   `json:"query,omitempty"`
+	Domains    []string `json:"domains,omitempty"`
+	MaxResults int      `json:"max_results,omitempty"`
+	Recency    string   `json:"recency,omitempty"`
 }
 
 // NewStreamState creates a new stream state.
 func NewStreamState() *StreamState {
 	return &StreamState{
-		ToolCalls:            make(map[int]*api.ToolCall),
-		WebSearchCalls:       make(map[string]int),
-		WebSearchInitialSent: make(map[string]bool),
-		ReasoningCompat:      "none", // Default to none
+		ToolCalls:       make(map[int]*api.ToolCall),
+		WebSearchState:  make(map[string]*WebSearchAccum),
+		WebSearchIndex:  make(map[string]int),
+		ReasoningCompat: "none", // Default to none
 	}
 }
 
 // SetReasoningCompat sets the reasoning compatibility mode.
 func (s *StreamState) SetReasoningCompat(mode string) {
 	s.ReasoningCompat = mode
+}
+
+// mergeWebSearchParams merges parameters from various sources into accumulated state.
+// Follows ChatMock's _merge_from pattern.
+func (s *StreamState) mergeWebSearchParams(callID string, item *WebSearchCallItem, data *WebSearchCallData) {
+	if s.WebSearchState[callID] == nil {
+		s.WebSearchState[callID] = &WebSearchAccum{}
+	}
+	accum := s.WebSearchState[callID]
+
+	// Merge from item
+	if item != nil {
+		if item.Query != "" && accum.Query == "" {
+			accum.Query = item.Query
+		}
+		if item.Parameters != nil {
+			if item.Parameters.Query != "" && accum.Query == "" {
+				accum.Query = item.Parameters.Query
+			}
+			if len(item.Parameters.Domains) > 0 && len(accum.Domains) == 0 {
+				accum.Domains = item.Parameters.Domains
+			}
+			if item.Parameters.MaxResults > 0 && accum.MaxResults == 0 {
+				accum.MaxResults = item.Parameters.MaxResults
+			}
+			if item.Parameters.Recency != "" && accum.Recency == "" {
+				accum.Recency = item.Parameters.Recency
+			}
+		}
+	}
+
+	// Merge from event data
+	if data != nil {
+		if data.Query != "" && accum.Query == "" {
+			accum.Query = data.Query
+		}
+		if data.Params != nil {
+			if data.Params.Query != "" && accum.Query == "" {
+				accum.Query = data.Params.Query
+			}
+			if len(data.Params.Domains) > 0 && len(accum.Domains) == 0 {
+				accum.Domains = data.Params.Domains
+			}
+			if data.Params.MaxResults > 0 && accum.MaxResults == 0 {
+				accum.MaxResults = data.Params.MaxResults
+			}
+			if data.Params.Recency != "" && accum.Recency == "" {
+				accum.Recency = data.Params.Recency
+			}
+		}
+	}
+}
+
+// serializeWebSearchArgs serializes accumulated web search params to JSON string.
+func (s *StreamState) serializeWebSearchArgs(callID string) string {
+	accum := s.WebSearchState[callID]
+	if accum == nil {
+		return "{}"
+	}
+	bytes, err := json.Marshal(accum)
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
 }
 
 // ProcessEvent processes an SSE event and returns OpenAI chunks if applicable.
@@ -595,62 +718,41 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 			return nil, err
 		}
 
-		if data.Item.Type == "function_call" {
-			tc := &api.ToolCall{
-				ID:   data.Item.CallID,
-				Type: "function",
-				Function: api.FunctionCall{
-					Name: data.Item.Name,
-				},
-			}
-			s.ToolCalls[data.OutputIndex] = tc
-
-			// Send initial tool call chunk
-			return []*api.ChatCompletionChunk{{
-				ID:      s.ResponseID,
-				Object:  "chat.completion.chunk",
-				Created: s.Created,
-				Model:   s.Model,
-				Choices: []api.Choice{{
-					Index: 0,
-					Delta: &api.Delta{
-						ToolCalls: []api.ToolCall{{
-							Index: intPtr(data.OutputIndex),
-							ID:    tc.ID,
-							Type:  "function",
-							Function: api.FunctionCall{
-								Name: tc.Function.Name,
-							},
-						}},
-					},
-				}},
-			}}, nil
-		}
-
-		// Handle web_search_call type
-		if data.Item.Type == "web_search_call" {
+		// Handle any *_call type as a function tool call
+		// This includes: function_call, web_search_call, mcp_call, etc.
+		if strings.HasSuffix(data.Item.Type, "_call") && data.Item.Type != "message" {
 			callID := data.Item.CallID
 			if callID == "" {
 				callID = data.Item.ID
 			}
 
-			// Use output_index for consistent tool call indexing
-			// Also track by callID for correlation in other events
-			s.WebSearchCalls[callID] = data.OutputIndex
+			// Determine tool name: use Name field, or derive from type (e.g., "web_search_call" -> "web_search")
+			name := data.Item.Name
+			if name == "" {
+				name = strings.TrimSuffix(data.Item.Type, "_call")
+			}
 
 			tc := &api.ToolCall{
 				ID:   callID,
 				Type: "function",
 				Function: api.FunctionCall{
-					Name:      "web_search",
-					Arguments: "{}",
+					Name: name,
 				},
 			}
 			s.ToolCalls[data.OutputIndex] = tc
 
-			// Mark as initial chunk sent
-			s.WebSearchInitialSent[callID] = true
+			// Update NextToolIndex to be beyond this index to avoid conflicts
+			if data.OutputIndex >= s.NextToolIndex {
+				s.NextToolIndex = data.OutputIndex + 1
+			}
 
+			// Track for web search state accumulation
+			if data.Item.Type == "web_search_call" {
+				s.WebSearchIndex[callID] = data.OutputIndex
+				s.WebSearchState[callID] = &WebSearchAccum{}
+			}
+
+			// Send initial tool call chunk
 			return []*api.ChatCompletionChunk{{
 				ID:      s.ResponseID,
 				Object:  "chat.completion.chunk",
@@ -664,7 +766,7 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 							ID:    callID,
 							Type:  "function",
 							Function: api.FunctionCall{
-								Name: "web_search",
+								Name: name,
 							},
 						}},
 					},
@@ -680,76 +782,93 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 			return nil, err
 		}
 
-		// Handle completed web_search_call
-		if data.Item.Type == "web_search_call" {
+		// Handle any *_call type completion
+		// For function_call, arguments are streamed via delta events - we just update state here
+		// For web_search_call, mcp_call, etc., arguments come in this event and need to be emitted
+		if strings.HasSuffix(data.Item.Type, "_call") && data.Item.Type != "message" {
 			callID := data.Item.CallID
 			if callID == "" {
 				callID = data.Item.ID
 			}
 
-			// Get index from output_index (consistent with output_item.added)
-			idx := data.OutputIndex
-			// Update map if not already present
-			if _, exists := s.WebSearchCalls[callID]; !exists {
-				s.WebSearchCalls[callID] = idx
+			// For function_call, arguments were already streamed via delta events
+			// Just update final state, don't emit (would cause duplicate content)
+			if data.Item.Type == "function_call" {
+				if tc, exists := s.ToolCalls[data.OutputIndex]; exists && data.Item.Arguments != "" {
+					tc.Function.Arguments = data.Item.Arguments
+				}
+				return nil, nil
 			}
 
-			// Build arguments from item
-			args := "{}"
+			// For other call types (web_search_call, mcp_call, etc.), emit arguments
+			var argsJSON string
 			if data.Item.Arguments != "" {
-				args = data.Item.Arguments
+				argsJSON = data.Item.Arguments
+			} else if data.Item.Type == "web_search_call" && data.Item.Parameters != nil {
+				// web_search_call may have Parameters object instead of Arguments string
+				bytes, _ := json.Marshal(data.Item.Parameters)
+				argsJSON = string(bytes)
+			} else if data.Item.Type == "web_search_call" {
+				// Fall back to accumulated state for web_search_call
+				argsJSON = s.serializeWebSearchArgs(callID)
 			}
 
-			// Update stored tool call
-			if tc, ok := s.ToolCalls[data.OutputIndex]; ok {
-				tc.Function.Arguments = args
+			// Find output index
+			outputIndex := -1
+			if idx, ok := s.WebSearchIndex[callID]; ok {
+				outputIndex = idx
+			} else {
+				// Search in ToolCalls
+				for idx, tc := range s.ToolCalls {
+					if tc.ID == callID {
+						outputIndex = idx
+						break
+					}
+				}
 			}
 
-			// Only send arguments delta (ID/Type/Name already sent in output_item.added)
-			chunks := []*api.ChatCompletionChunk{{
-				ID:      s.ResponseID,
-				Object:  "chat.completion.chunk",
-				Created: s.Created,
-				Model:   s.Model,
-				Choices: []api.Choice{{
-					Index: 0,
-					Delta: &api.Delta{
-						ToolCalls: []api.ToolCall{{
-							Index:    intPtr(idx),
-							Function: api.FunctionCall{Arguments: args},
-						}},
-					},
-				}},
-			}}
+			// If we found the tool call, update and emit arguments
+			// Use empty object if no arguments available (OpenAI API expects arguments field)
+			if outputIndex >= 0 {
+				if argsJSON == "" {
+					argsJSON = "{}"
+				}
+				if tc, exists := s.ToolCalls[outputIndex]; exists {
+					tc.Function.Arguments = argsJSON
+				}
 
-			// Send finish chunk only once
-			if !s.SentToolCallFinish {
-				s.SentToolCallFinish = true
-				chunks = append(chunks, &api.ChatCompletionChunk{
+				return []*api.ChatCompletionChunk{{
 					ID:      s.ResponseID,
 					Object:  "chat.completion.chunk",
 					Created: s.Created,
 					Model:   s.Model,
 					Choices: []api.Choice{{
-						Index:        0,
-						Delta:        &api.Delta{},
-						FinishReason: stringPtr("tool_calls"),
+						Index: 0,
+						Delta: &api.Delta{
+							ToolCalls: []api.ToolCall{{
+								Index:    intPtr(outputIndex),
+								Function: api.FunctionCall{Arguments: argsJSON},
+							}},
+						},
 					}},
-				})
+				}}, nil
 			}
 
-			return chunks, nil
+			// Tool call not tracked - this indicates the output_item.added event was missed
+			slog.Debug("output_item.done for untracked tool call",
+				"call_id", callID,
+				"type", data.Item.Type)
 		}
 
 		return nil, nil
 
 	case EventWebSearchCallSearching, EventWebSearchCallInProgress, EventWebSearchCallCompleted:
-		// Handle web search call events
 		var data WebSearchCallData
 		if err := json.Unmarshal(event.Data, &data); err != nil {
 			return nil, err
 		}
 
+		// Get call ID from various possible locations
 		callID := data.ItemID
 		if callID == "" && data.Item != nil {
 			callID = data.Item.CallID
@@ -761,31 +880,58 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 			return nil, nil
 		}
 
-		// Get index: prefer OutputIndex from event, fallback to map lookup
-		idx, exists := s.WebSearchCalls[callID]
-		if !exists {
-			// Use OutputIndex if provided, otherwise skip (should have been added via output_item.added)
-			if data.OutputIndex > 0 {
-				idx = data.OutputIndex
-				s.WebSearchCalls[callID] = idx
-			} else {
-				// No index available, skip this event
-				return nil, nil
+		// Merge params from this event into accumulated state
+		s.mergeWebSearchParams(callID, data.Item, &data)
+
+		// Get output index (may have been set in output_item.added)
+		outputIndex, ok := s.WebSearchIndex[callID]
+		isFirstChunk := !ok
+		if !ok {
+			// Not yet tracked, assign next available index
+			outputIndex = s.NextToolIndex
+			s.NextToolIndex++
+			s.WebSearchIndex[callID] = outputIndex
+
+			// Create tool call if not exists
+			if _, exists := s.ToolCalls[outputIndex]; !exists {
+				s.ToolCalls[outputIndex] = &api.ToolCall{
+					ID:   callID,
+					Type: "function",
+					Function: api.FunctionCall{
+						Name: "web_search",
+					},
+				}
 			}
 		}
 
-		// Build arguments safely using JSON marshaling
-		query := ""
-		if data.Query != "" {
-			query = data.Query
-		} else if data.Params != nil && data.Params.Query != "" {
-			query = data.Params.Query
-		} else if data.Item != nil && data.Item.Query != "" {
-			query = data.Item.Query
-		}
-		args := buildWebSearchArgs(query)
+		// Serialize current accumulated args
+		argsJSON := s.serializeWebSearchArgs(callID)
 
-		// Only send arguments delta (ID/Type/Name already sent in output_item.added)
+		// Update stored tool call
+		if tc, exists := s.ToolCalls[outputIndex]; exists {
+			tc.Function.Arguments = argsJSON
+		}
+
+		// Emit streaming chunk with current args
+		// Only include full metadata (ID, Type, Name) on first chunk; subsequent chunks only need Index + Arguments
+		var toolCall api.ToolCall
+		if isFirstChunk {
+			toolCall = api.ToolCall{
+				Index: intPtr(outputIndex),
+				ID:    callID,
+				Type:  "function",
+				Function: api.FunctionCall{
+					Name:      "web_search",
+					Arguments: argsJSON,
+				},
+			}
+		} else {
+			toolCall = api.ToolCall{
+				Index:    intPtr(outputIndex),
+				Function: api.FunctionCall{Arguments: argsJSON},
+			}
+		}
+
 		chunks := []*api.ChatCompletionChunk{{
 			ID:      s.ResponseID,
 			Object:  "chat.completion.chunk",
@@ -794,29 +940,13 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 			Choices: []api.Choice{{
 				Index: 0,
 				Delta: &api.Delta{
-					ToolCalls: []api.ToolCall{{
-						Index:    intPtr(idx),
-						Function: api.FunctionCall{Arguments: args},
-					}},
+					ToolCalls: []api.ToolCall{toolCall},
 				},
 			}},
 		}}
 
-		// Send finish if completed (only once)
-		if event.Event == EventWebSearchCallCompleted && !s.SentToolCallFinish {
-			s.SentToolCallFinish = true
-			chunks = append(chunks, &api.ChatCompletionChunk{
-				ID:      s.ResponseID,
-				Object:  "chat.completion.chunk",
-				Created: s.Created,
-				Model:   s.Model,
-				Choices: []api.Choice{{
-					Index:        0,
-					Delta:        &api.Delta{},
-					FinishReason: stringPtr("tool_calls"),
-				}},
-			})
-		}
+		// Note: We don't emit finish_reason here because there may be multiple tool calls.
+		// The final finish_reason is emitted in EventResponseCompleted.
 
 		return chunks, nil
 
@@ -853,11 +983,7 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 
 		// Extract usage
 		if data.Response.Usage != nil {
-			s.Usage = &api.Usage{
-				PromptTokens:     data.Response.Usage.InputTokens,
-				CompletionTokens: data.Response.Usage.OutputTokens,
-				TotalTokens:      data.Response.Usage.TotalTokens,
-			}
+			s.Usage = extractUsage(data.Response.Usage)
 		}
 
 		// Send final chunk if not already sent
@@ -936,11 +1062,7 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 
 		// Extract usage if present
 		if data.Response.Usage != nil {
-			s.Usage = &api.Usage{
-				PromptTokens:     data.Response.Usage.InputTokens,
-				CompletionTokens: data.Response.Usage.OutputTokens,
-				TotalTokens:      data.Response.Usage.TotalTokens,
-			}
+			s.Usage = extractUsage(data.Response.Usage)
 		}
 
 		// Send final chunk
@@ -979,8 +1101,32 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 		}
 		return nil, nil
 
-	case EventResponseContentPartAdded, EventResponseContentPartDone:
-		// Content part events are informational, actual content comes through text delta events
+	case EventResponseContentPartAdded:
+		var data ContentPartAddedData
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			return nil, err
+		}
+
+		// Handle refusal content parts
+		if data.Part.Type == "refusal" && data.Part.Text != "" {
+			s.Refusal += data.Part.Text
+			return []*api.ChatCompletionChunk{{
+				ID:      s.ResponseID,
+				Object:  "chat.completion.chunk",
+				Created: s.Created,
+				Model:   s.Model,
+				Choices: []api.Choice{{
+					Index: 0,
+					Delta: &api.Delta{Refusal: data.Part.Text},
+				}},
+			}}, nil
+		}
+
+		// Other content part types (output_text, etc.) are handled via their delta events
+		return nil, nil
+
+	case EventResponseContentPartDone:
+		// Content part completion marker - no action needed
 		return nil, nil
 
 	case EventResponseReasoningSummaryPartDone, EventResponseReasoningTextDone,
@@ -990,13 +1136,20 @@ func (s *StreamState) ProcessEvent(event *sse.Event) ([]*api.ChatCompletionChunk
 		return nil, nil
 
 	case EventFileSearchCallSearching, EventFileSearchCallInProgress, EventFileSearchCallCompleted,
-		EventMCPCallInProgress, EventMCPCallCompleted, EventMCPCallFailed:
-		// File search and MCP events - currently treated as informational
-		// Could be expanded to emit tool call chunks if needed
+		EventMCPCallInProgress, EventMCPCallCompleted, EventMCPCallFailed,
+		EventMCPCallArgumentsDelta, EventMCPCallArgumentsDone,
+		EventCodeInterpreterCallInProgress, EventCodeInterpreterCallInterpreting, EventCodeInterpreterCallCompleted,
+		EventCodeInterpreterCallCodeDelta, EventCodeInterpreterCallCodeDone,
+		EventImageGenerationCallInProgress, EventImageGenerationCallGenerating,
+		EventImageGenerationCallPartialImage, EventImageGenerationCallCompleted:
+		// Built-in tool events - these are server-side tools, not exposed to clients
+		return nil, nil
+
+	default:
+		// Log unknown events at debug level for visibility
+		slog.Debug("unknown SSE event type ignored", "event", event.Event)
 		return nil, nil
 	}
-
-	return nil, nil
 }
 
 // GetUsageChunk returns a chunk with usage information for streaming.
@@ -1062,6 +1215,11 @@ func (s *StreamState) BuildNonStreamingResponse() *api.ChatCompletionResponse {
 	}
 	msg.SetContentString(content)
 
+	// Add refusal if present
+	if s.Refusal != "" {
+		msg.Refusal = s.Refusal
+	}
+
 	// Add tool calls if any (sorted by output index)
 	// Note: For non-streaming responses, tool calls should NOT have Index field
 	if len(s.ToolCalls) > 0 {
@@ -1107,4 +1265,32 @@ func (s *StreamState) BuildNonStreamingResponse() *api.ChatCompletionResponse {
 
 func currentTimestamp() int64 {
 	return time.Now().Unix()
+}
+
+// extractUsage converts ChatGPT usage data to OpenAI format with detailed token breakdown.
+func extractUsage(usage *UsageData) *api.Usage {
+	if usage == nil {
+		return nil
+	}
+
+	result := &api.Usage{
+		PromptTokens:     usage.InputTokens,
+		CompletionTokens: usage.OutputTokens,
+		TotalTokens:      usage.TotalTokens,
+	}
+
+	// Add detailed token breakdown if available
+	if usage.InputTokensDetails != nil && usage.InputTokensDetails.CachedTokens > 0 {
+		result.PromptTokensDetails = &api.PromptTokenDetails{
+			CachedTokens: usage.InputTokensDetails.CachedTokens,
+		}
+	}
+
+	if usage.OutputTokensDetails != nil && usage.OutputTokensDetails.ReasoningTokens > 0 {
+		result.CompletionTokensDetails = &api.CompletionTokenDetails{
+			ReasoningTokens: usage.OutputTokensDetails.ReasoningTokens,
+		}
+	}
+
+	return result
 }
