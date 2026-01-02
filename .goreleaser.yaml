@@ -47,7 +47,7 @@ changelog:
       regexp: '^.*?(fix|refactor)(\(.+\))??!?:.+$'
       order: 1
     - title: Documentation
-      regexp: '^.*?docs?(\(.+\))??!?:.+$'
+      regexp: '^.*?docs(\(.+\))??!?:.+$'
       order: 2
     - title: Other
       order: 999
