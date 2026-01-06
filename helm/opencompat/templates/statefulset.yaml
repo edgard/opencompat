@@ -1,0 +1,176 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "opencompat.fullname" . }}
+  labels:
+    {{- include "opencompat.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ include "opencompat.fullname" . }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "opencompat.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.config.oauthClientID }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "opencompat.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "opencompat.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: setup-permissions
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Creating directories..."
+              mkdir -p /data/opencompat /cache/opencompat
+
+              echo "Setting ownership..."
+              chown -R 65532:65532 /data /cache
+              chmod 700 /data/opencompat /cache/opencompat
+
+              # Copy auth.json from secret if it exists and hasn't been copied yet
+              if [ -f /auth-seed/auth.json ] && [ ! -f /data/opencompat/auth.json ]; then
+                echo "Copying auth.json from secret..."
+                cp /auth-seed/auth.json /data/opencompat/auth.json
+                chmod 600 /data/opencompat/auth.json
+                chown 65532:65532 /data/opencompat/auth.json
+                echo "Auth credentials initialized successfully"
+              elif [ -f /data/opencompat/auth.json ]; then
+                echo "Auth credentials already exist, ensuring correct permissions..."
+                chmod 600 /data/opencompat/auth.json
+                chown 65532:65532 /data/opencompat/auth.json
+              else
+                echo "Warning: No auth.json found. You may need to create the opencompat-auth secret."
+              fi
+
+              echo "Initialization complete"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: cache
+              mountPath: /cache
+            - name: auth-seed
+              mountPath: /auth-seed
+              readOnly: true
+          securityContext:
+            runAsUser: 0  # Required for chown
+      containers:
+        - name: opencompat
+          image: {{ include "opencompat.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/opencompat"]
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "opencompat.fullname" . }}
+            {{- if .Values.config.oauthClientID }}
+            - secretRef:
+                name: {{ include "opencompat.fullname" . }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: cache
+              mountPath: /cache
+          {{- with .Values.startupProbe }}
+          {{- if .enabled }}
+          startupProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          {{- if .enabled }}
+          livenessProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          {{- if .enabled }}
+          readinessProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      volumes:
+        - name: auth-seed
+          secret:
+            secretName: opencompat-auth
+            defaultMode: 0600
+            optional: true
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    {{- if .Values.persistence.data.enabled }}
+    - metadata:
+        name: data
+        {{- with .Values.persistence.data.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          - {{ .Values.persistence.data.accessMode }}
+        {{- if .Values.persistence.data.storageClass }}
+        storageClassName: {{ .Values.persistence.data.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size }}
+    {{- end }}
+    {{- if .Values.persistence.cache.enabled }}
+    - metadata:
+        name: cache
+        {{- with .Values.persistence.cache.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          - {{ .Values.persistence.cache.accessMode }}
+        {{- if .Values.persistence.cache.storageClass }}
+        storageClassName: {{ .Values.persistence.cache.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.cache.size }}
+    {{- end }}
